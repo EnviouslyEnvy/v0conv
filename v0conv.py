@@ -117,8 +117,8 @@ class MusicConverter:
         self.target_entry.insert(0, self.target_base_folder)  # Load saved value
         ttk.Button(main_frame, text="Browse...", command=self.select_target_folder).grid(row=4, column=2, pady=5)
 
-        # Recently edited source folders that are not already in the target tree
-        recent_frame = ttk.LabelFrame(main_frame, text="Recently edited folders missing from target")
+        # Recently edited source folders, including ones converted in the same pass
+        recent_frame = ttk.LabelFrame(main_frame, text="Recently edited folders")
         recent_frame.grid(row=5, column=0, columnspan=3, sticky=tk.W+tk.E+tk.N+tk.S, pady=5)
         main_frame.rowconfigure(5, weight=2)
 
@@ -155,15 +155,17 @@ class MusicConverter:
 
         self.recent_tree = ttk.Treeview(
             recent_list_frame,
-            columns=('edited', 'folder'),
+            columns=('edited', 'status', 'folder'),
             show='headings',
             selectmode='extended',
             height=5
         )
         self.recent_tree.heading('edited', text='Edited')
+        self.recent_tree.heading('status', text='Status')
         self.recent_tree.heading('folder', text='Folder (relative to source base)')
         self.recent_tree.column('edited', width=140, stretch=False)
-        self.recent_tree.column('folder', width=640, stretch=True)
+        self.recent_tree.column('status', width=100, stretch=False)
+        self.recent_tree.column('folder', width=540, stretch=True)
         recent_scroll = ttk.Scrollbar(recent_list_frame, orient=tk.VERTICAL, command=self.recent_tree.yview)
         self.recent_tree.configure(yscrollcommand=recent_scroll.set)
         self.recent_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -178,9 +180,21 @@ class MusicConverter:
             variable=self.track_loose_files_var,
             command=self._toggle_loose_file_tracking
         ).pack(side=tk.LEFT)
-        ttk.Label(loose_header, text="New files directly in the target:").pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(loose_header, text="New files inside existing folders:").pack(side=tk.LEFT, padx=(12, 0))
         self.loose_count_var = tk.StringVar(value="")
         ttk.Label(loose_header, textvariable=self.loose_count_var).pack(side=tk.RIGHT)
+        self.copy_loose_button = ttk.Button(
+            loose_header,
+            text="Copy file",
+            command=self.copy_selected_loose_file
+        )
+        self.copy_loose_button.pack(side=tk.RIGHT, padx=(0, 5))
+        self.queue_loose_button = ttk.Button(
+            loose_header,
+            text="Queue tracks",
+            command=self.queue_selected_tracks
+        )
+        self.queue_loose_button.pack(side=tk.RIGHT, padx=5)
         self.show_loose_button = ttk.Button(
             loose_header,
             text="Show in Explorer",
@@ -192,15 +206,17 @@ class MusicConverter:
         loose_list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
         self.loose_tree = ttk.Treeview(
             loose_list_frame,
-            columns=('edited', 'file'),
+            columns=('edited', 'library', 'file'),
             show='headings',
-            selectmode='browse',
+            selectmode='extended',
             height=4
         )
         self.loose_tree.heading('edited', text='Edited')
-        self.loose_tree.heading('file', text='New or updated file (directly in target)')
+        self.loose_tree.heading('library', text='Library')
+        self.loose_tree.heading('file', text='File inside an existing folder')
         self.loose_tree.column('edited', width=140, stretch=False)
-        self.loose_tree.column('file', width=640, stretch=True)
+        self.loose_tree.column('library', width=100, stretch=False)
+        self.loose_tree.column('file', width=540, stretch=True)
         loose_scroll = ttk.Scrollbar(loose_list_frame, orient=tk.VERTICAL, command=self.loose_tree.yview)
         self.loose_tree.configure(yscrollcommand=loose_scroll.set)
         self.loose_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -208,7 +224,7 @@ class MusicConverter:
         self.loose_tree.bind('<Double-1>', lambda _event: self.show_selected_loose_file())
         self.loose_by_id = {}
 
-        queue_frame = ttk.LabelFrame(main_frame, text="Conversion queue (one folder at a time)")
+        queue_frame = ttk.LabelFrame(main_frame, text="Conversion queue (one folder or track at a time)")
         queue_frame.grid(row=6, column=0, columnspan=3, sticky=tk.W+tk.E+tk.N+tk.S, pady=5)
         main_frame.rowconfigure(6, weight=1)
 
@@ -240,7 +256,7 @@ class MusicConverter:
             height=4
         )
         self.queue_tree.heading('edited', text='Edited')
-        self.queue_tree.heading('folder', text='Queued folder')
+        self.queue_tree.heading('folder', text='Queued folder or track')
         self.queue_tree.column('edited', width=140, stretch=False)
         self.queue_tree.column('folder', width=640, stretch=True)
         queue_scroll = ttk.Scrollbar(queue_list_frame, orient=tk.VERTICAL, command=self.queue_tree.yview)
@@ -482,6 +498,7 @@ class MusicConverter:
         self.convert_button.config(state=state)
         self.scan_button.config(state=state)
         self.queue_selected_button.config(state=state)
+        self.queue_loose_button.config(state=state)
         self.convert_queue_button.config(state=state)
         self.remove_queue_button.config(state=state)
         self.clear_queue_button.config(state=state)
@@ -567,6 +584,91 @@ class MusicConverter:
         ]
         return any(candidate in target_index for candidate in candidates)
 
+    def _same_session_seconds(self):
+        """A target folder edited this soon after the source folder was part of that same conversion."""
+        return 12 * 60 * 60
+
+    def _existing_target_dir(self, rel_path, target_base):
+        for candidate in (self._transform_flac_path(rel_path), rel_path):
+            if candidate in ('', '.', os.curdir):
+                path = target_base
+            else:
+                path = os.path.normpath(os.path.join(target_base, candidate))
+            if os.path.isdir(path):
+                return path
+        return None
+
+    def _output_file_exists(self, source_file, source_base, target_base):
+        expected = self._expected_target_file_rel(source_file, source_base)
+        if os.path.isfile(os.path.join(target_base, expected)):
+            return True
+        relative = os.path.relpath(source_file, source_base)
+        if os.path.normcase(os.path.normpath(relative)) == os.path.normcase(os.path.normpath(expected)):
+            return False
+        return os.path.isfile(os.path.join(target_base, relative))
+
+    def _classify_music_folder(self, folder, source_base, target_base):
+        """
+        Missing: the target folder is absent, or conversion stopped before the tracks were written.
+        Converted: the tracks are in the target and that folder was written in the same pass as the source edit.
+        None: an older completed album, or a finished album with only a newly added track.
+        """
+        try:
+            names = os.listdir(folder['path'])
+        except OSError:
+            return None
+        audio_extensions = self._audio_extensions()
+        audio_files = []
+        for name in names:
+            if os.path.splitext(name)[1].lower() not in audio_extensions:
+                continue
+            path = os.path.join(folder['path'], name)
+            if os.path.isfile(path):
+                audio_files.append(path)
+        if not audio_files:
+            return None
+
+        target_dir = self._existing_target_dir(folder['rel'], target_base)
+        if target_dir is None:
+            return {'status': 'Missing', 'target': None}
+
+        missing = []
+        present_mtimes = []
+        for path in audio_files:
+            if self._output_file_exists(path, source_base, target_base):
+                try:
+                    present_mtimes.append(os.path.getmtime(path))
+                except OSError:
+                    present_mtimes.append(0)
+            else:
+                missing.append(path)
+
+        if not missing:
+            try:
+                target_mtime = os.path.getmtime(target_dir)
+            except OSError:
+                return None
+            if folder['mtime'] - 120 <= target_mtime <= folder['mtime'] + self._same_session_seconds():
+                return {'status': 'Converted', 'target': target_dir}
+            return None
+
+        if present_mtimes:
+            newest_done = max(present_mtimes)
+            gap = self._individual_file_gap_seconds()
+            only_new_tracks = True
+            for path in missing:
+                try:
+                    edited = os.path.getmtime(path)
+                except OSError:
+                    only_new_tracks = False
+                    break
+                if edited < newest_done + gap:
+                    only_new_tracks = False
+                    break
+            if only_new_tracks:
+                return None
+        return {'status': 'Missing', 'target': target_dir}
+
     def scan_recent_folders(self):
         if self.conversion_in_progress or self.scan_in_progress or self.transfer_in_progress:
             return
@@ -608,81 +710,262 @@ class MusicConverter:
             self.root.after(0, lambda: self.status_var.set("Indexing target folders..."))
             target_index = self._index_directories(target_base, False, "Indexing target")
 
-            missing = [
-                folder for folder in source_folders
-                if not self._folder_is_in_target(folder['rel'], target_index)
-            ]
-            missing.sort(key=lambda folder: folder['mtime'], reverse=True)
-            shown = missing[:limit]
+            classified = []
+            for folder in source_folders:
+                info = self._classify_music_folder(folder, source_base, target_base)
+                if not info:
+                    continue
+                listed = dict(folder)
+                listed['status'] = info['status']
+                listed['target'] = info['target']
+                classified.append(listed)
+            classified.sort(key=lambda folder: folder['mtime'], reverse=True)
+            shown = classified[:limit]
+            missing_count = sum(1 for folder in classified if folder['status'] == 'Missing')
+            converted_count = sum(1 for folder in classified if folder['status'] == 'Converted')
             loose_files = []
-            loose_snapshot = None
             if track_files:
-                current_files = self._files_directly_in_directory(target_base)
-                loose_files = self._newly_added_direct_files(current_files, self.tracked_loose_files)[:limit]
-                loose_snapshot = {item['name']: item['mtime'] for item in current_files}
+                self.root.after(0, lambda: self.status_var.set("Checking individual music files..."))
+                loose_files = self._individual_music_files(source_base, target_base, target_index, limit)
+            self.source_base_folder = source_base
+            self.target_base_folder = target_base
             self.root.after(
                 0,
-                lambda shown=shown, source_count=len(source_folders), target_count=len(target_index), missing_count=len(missing), limit=limit, loose_files=loose_files, track_files=track_files, loose_snapshot=loose_snapshot: self._show_recent_folders(
-                    shown, source_count, target_count, missing_count, limit, loose_files, track_files, loose_snapshot
+                lambda shown=shown, source_count=len(source_folders), target_count=len(target_index), missing_count=missing_count, converted_count=converted_count, limit=limit, loose_files=loose_files, track_files=track_files: self._show_recent_folders(
+                    shown, source_count, target_count, missing_count, converted_count, limit, loose_files, track_files
                 )
             )
         except Exception as e:
             message = str(e)
             self.root.after(0, lambda message=message: self._scan_failed(message))
 
-    def _files_directly_in_directory(self, directory):
-        """Files whose parent is the target folder itself, newest edited date first."""
-        skipped_names = {'desktop.ini', 'thumbs.db'}
-        files = []
-        try:
-            names = os.listdir(directory)
-        except OSError:
-            return files
-        for name in names:
-            if name.startswith('.') or name.lower() in skipped_names:
-                continue
-            path = os.path.join(directory, name)
-            if not os.path.isfile(path):
-                continue
-            try:
-                edited = os.path.getmtime(path)
-            except OSError:
-                continue
-            files.append({'path': path, 'name': name, 'mtime': edited})
-        files.sort(key=lambda item: item['mtime'], reverse=True)
-        return files
+    def _expected_target_file_rel(self, source_file, source_base):
+        """Relative target path this source file would be converted or copied to."""
+        relative = os.path.relpath(source_file, source_base)
+        relative_dir = os.path.dirname(relative)
+        transformed_dir = self._transform_flac_path(relative_dir) if relative_dir else ''
+        extension = os.path.splitext(source_file)[1].lower()
+        lossless = {'.flac', '.wav', '.aiff', '.aif', '.ape', '.alac'}
+        output_name = os.path.splitext(os.path.basename(source_file))[0] + '.mp3' if extension in lossless else os.path.basename(source_file)
+        if transformed_dir:
+            return os.path.join(transformed_dir, output_name)
+        return output_name
 
-    def _newly_added_direct_files(self, current_files, known_files):
-        """Files new since the last tracking snapshot, or edited again after it."""
-        added = []
-        for item in current_files:
-            previous = known_files.get(item['name']) if known_files else None
-            if previous is None:
-                status = 'added'
-            else:
-                try:
-                    previous_mtime = float(previous)
-                except (TypeError, ValueError):
-                    previous_mtime = 0
-                if item['mtime'] <= previous_mtime + 1:
+    def _individual_file_gap_seconds(self):
+        """A track counts as added on its own when it is this much newer than the rest of its folder."""
+        return 30 * 60
+
+    def _audio_files_by_directory(self, base_dir, status_label):
+        grouped = {}
+        seen = 0
+        audio_extensions = self._audio_extensions()
+
+        def on_walk_error(err):
+            message = f"Skipped unreadable directory: {getattr(err, 'filename', err)}"
+            self.root.after(0, lambda msg=message: self.log(msg))
+
+        for current_dir, _dirs, filenames in os.walk(base_dir, onerror=on_walk_error):
+            seen += 1
+            if seen % 250 == 0:
+                self.root.after(
+                    0,
+                    lambda count=seen, label=status_label: self.status_var.set(f"{label} ({count} folders)")
+                )
+            relative_dir = os.path.relpath(current_dir, base_dir)
+            try:
+                directory_edited = os.path.getmtime(current_dir)
+            except OSError:
+                directory_edited = 0
+            tracks = []
+            for name in filenames:
+                if os.path.splitext(name)[1].lower() not in audio_extensions:
                     continue
-                status = 'updated'
-            noted = dict(item)
-            noted['status'] = status
-            added.append(noted)
-        added.sort(key=lambda item: item['mtime'], reverse=True)
-        return added
+                path = os.path.join(current_dir, name)
+                try:
+                    edited = os.path.getmtime(path)
+                except OSError:
+                    continue
+                relative = name if relative_dir == '.' else os.path.join(relative_dir, name)
+                tracks.append({
+                    'path': path,
+                    'name': relative,
+                    'mtime': edited,
+                    'dir': relative_dir,
+                    'dir_mtime': directory_edited
+                })
+            if tracks:
+                grouped[relative_dir] = tracks
+        return grouped
+
+    def _files_newer_than_their_folder(self, grouped, library):
+        """
+        Tracks edited well after the other audio files already in that same folder.
+        Files added together stay in one group: the cut is the first gap of
+        `_individual_file_gap_seconds` between a file and the next older one.
+        """
+        gap = self._individual_file_gap_seconds()
+        found = []
+        for tracks in grouped.values():
+            if len(tracks) < 2:
+                continue
+            ordered = sorted(tracks, key=lambda track: track['mtime'])
+            cut = None
+            for index in range(len(ordered) - 1, 0, -1):
+                if ordered[index]['mtime'] >= ordered[index - 1]['mtime'] + gap:
+                    cut = index
+                    break
+            if cut is None:
+                continue
+            for track in ordered[cut:]:
+                found.append({
+                    'path': track['path'],
+                    'name': track['name'],
+                    'mtime': track['mtime'],
+                    'dir_mtime': track.get('dir_mtime', track['mtime']),
+                    'library': library
+                })
+        return found
+
+    def _relative_key(self, relative):
+        return os.path.normcase(os.path.normpath(relative))
+
+    def _individual_snapshot(self):
+        stored = self.tracked_loose_files
+        if not isinstance(stored, dict) or stored.get('version') != 2:
+            return None
+        if not isinstance(stored.get('source_paths'), list) or not isinstance(stored.get('target_paths'), list):
+            return None
+        return stored
+
+    def _target_folder_has_audio(self, relative_dir, target_by_rel):
+        if relative_dir == '.':
+            parents = {''}
+        else:
+            parents = {
+                self._relative_key(relative_dir),
+                self._relative_key(self._transform_flac_path(relative_dir))
+            }
+        for relative in target_by_rel:
+            parent = os.path.normcase(os.path.dirname(os.path.normpath(relative)))
+            if parent in parents:
+                return True
+        return False
+
+    def _folder_was_edited_after_its_tracks(self, tracks):
+        """True when the folder's edited date is much newer than the tracks already in it."""
+        if not tracks:
+            return False
+        ordered = sorted(track['mtime'] for track in tracks)
+        median = ordered[len(ordered) // 2]
+        return tracks[0]['dir_mtime'] >= median + self._individual_file_gap_seconds()
+
+    def _individual_music_files(self, source_base, target_base, target_dirs, limit):
+        """
+        Single tracks added inside folders that already exist.
+        A new album that is missing from Lossy Music stays on the folder list.
+        Non-lossy rows are source files, such as one flac dropped into an existing album.
+        Lossy rows are files already in Lossy Music, which are the ones to send to the phone.
+        """
+        target_audio = self._audio_files_by_directory(target_base, "Checking Lossy Music files")
+        source_audio = self._audio_files_by_directory(source_base, "Checking non-lossy files")
+        target_by_rel = {
+            self._relative_key(track['name']): track
+            for tracks in target_audio.values()
+            for track in tracks
+        }
+        snapshot = self._individual_snapshot()
+        previous_source = set(snapshot['source_paths']) if snapshot else set()
+        previous_target = set(snapshot['target_paths']) if snapshot else set()
+        previous_target_dirs = {
+            os.path.normcase(os.path.dirname(os.path.normpath(path)))
+            for path in previous_target
+        }
+        if snapshot is not None:
+            previous_target_dirs.add('')
+        source_already_there = {
+            relative_dir: tracks
+            for relative_dir, tracks in source_audio.items()
+            if relative_dir == '.' or self._folder_is_in_target(relative_dir, target_dirs)
+        }
+        by_path = {}
+
+        def add(track, library):
+            key = os.path.normcase(track['path'])
+            sort_time = max(track['mtime'], track.get('dir_mtime', track['mtime']))
+            current = by_path.get(key)
+            if current and current['sort_time'] >= sort_time:
+                return
+            by_path[key] = {
+                'path': track['path'],
+                'name': track['name'],
+                'mtime': track['mtime'],
+                'library': library,
+                'sort_time': sort_time
+            }
+
+        def output_for(source_track):
+            expected = self._expected_target_file_rel(source_track['path'], source_base)
+            for relative in (expected, source_track['name']):
+                match = target_by_rel.get(self._relative_key(relative))
+                if match:
+                    return match
+            return None
+
+        for item in self._files_newer_than_their_folder(target_audio, 'Lossy'):
+            add(item, 'Lossy')
+        for item in self._files_newer_than_their_folder(source_already_there, 'Non-lossy'):
+            add(item, 'Non-lossy')
+
+        current_source = []
+        for tracks in source_audio.values():
+            for track in tracks:
+                current_source.append(self._relative_key(track['name']))
+
+        for tracks in target_audio.values():
+            for track in tracks:
+                if snapshot is None:
+                    continue
+                parent = os.path.normcase(os.path.dirname(os.path.normpath(track['name'])))
+                if parent not in previous_target_dirs:
+                    continue
+                if self._relative_key(track['name']) in previous_target:
+                    continue
+                add(track, 'Lossy')
+
+        for relative_dir, tracks in source_already_there.items():
+            folder_touched = self._folder_was_edited_after_its_tracks(tracks)
+            album_already_has_audio = self._target_folder_has_audio(relative_dir, target_by_rel)
+            for track in tracks:
+                source_key = self._relative_key(track['name'])
+                appeared = snapshot is not None and source_key not in previous_source
+                output = output_for(track)
+                added_to_existing_album = len(tracks) == 1 and album_already_has_audio
+                if output is None and (folder_touched or added_to_existing_album or appeared):
+                    add(track, 'Non-lossy')
+                elif appeared:
+                    add(track, 'Non-lossy')
+                    if output:
+                        add(output, 'Lossy')
+
+        self._pending_individual_snapshot = {
+            'version': 2,
+            'source_paths': current_source,
+            'target_paths': [self._relative_key(track['name']) for tracks in target_audio.values() for track in tracks]
+        }
+        found = list(by_path.values())
+        found.sort(key=lambda item: (-item['mtime'], item['name'].lower()))
+        return found[:limit]
 
     def _toggle_loose_file_tracking(self):
         self.track_loose_files = bool(self.track_loose_files_var.get())
         self.save_directory_config()
         if self.track_loose_files:
             self.loose_count_var.set("Scan to check")
-            self.log("Individual file tracking is on. Scan folders to list files added directly in the target.")
+            self.log("Individual file tracking is on. Scan to list new tracks inside folders that already exist, in the source and in Lossy Music.")
             return
         self._show_loose_target_files([], tracking=False)
 
-    def _show_recent_folders(self, folders, source_count, target_count, missing_count, limit, loose_files=None, track_files=False, loose_snapshot=None):
+    def _show_recent_folders(self, folders, source_count, target_count, missing_count, converted_count, limit, loose_files=None, track_files=False):
         existing = self.recent_tree.get_children()
         if existing:
             self.recent_tree.delete(*existing)
@@ -690,28 +973,47 @@ class MusicConverter:
 
         for folder in folders:
             edited = datetime.fromtimestamp(folder['mtime']).strftime('%Y-%m-%d %H:%M')
-            item_id = self.recent_tree.insert('', tk.END, values=(edited, folder['rel']))
+            item_id = self.recent_tree.insert('', tk.END, values=(edited, folder.get('status', ''), folder['rel']))
             self.recent_by_id[item_id] = folder
 
         shown_count = len(folders)
-        if missing_count > shown_count:
-            summary = f"Showing {shown_count} of {missing_count} missing (newest {limit})"
+        listed_total = missing_count + converted_count
+        if listed_total > shown_count:
+            summary = f"Showing {shown_count} of {listed_total} newest. {missing_count} missing, {converted_count} converted"
         else:
-            summary = f"{missing_count} missing folder{'s' if missing_count != 1 else ''}"
+            summary = f"{missing_count} missing, {converted_count} converted"
         self.recent_count_var.set(summary)
         self.status_var.set(
             f"Indexed {source_count} source folders and {target_count} target folders. {summary}."
         )
         self.log(
             f"Index complete: {source_count} source music folders, "
-            f"{target_count} target directories, {missing_count} not found in target."
+            f"{target_count} target directories, {missing_count} missing, {converted_count} converted in the same pass."
         )
+        converted_sources = []
+        recent_cutoff = datetime.now().timestamp() - 48 * 60 * 60
+        for folder in folders:
+            if folder.get('status') != 'Converted':
+                continue
+            target = folder.get('target')
+            try:
+                edited = os.path.getmtime(target) if target else 0
+            except OSError:
+                edited = 0
+            if edited >= recent_cutoff:
+                converted_sources.append(folder['path'])
+        if converted_sources:
+            self.last_converted_outputs = self._jobs_for_sources(converted_sources)
+            self._fill_latest_converted_list()
         if track_files:
-            self.tracked_loose_files = loose_snapshot or {}
             self.track_loose_files = True
+            snapshot = getattr(self, '_pending_individual_snapshot', None)
+            if snapshot:
+                self.tracked_loose_files = snapshot
             self.save_directory_config()
         self._show_loose_target_files(loose_files or [], tracking=track_files)
         self.scan_in_progress = False
+        self._update_send_last_button()
         if not self.conversion_in_progress:
             self.scan_button.config(state=tk.NORMAL)
 
@@ -725,30 +1027,92 @@ class MusicConverter:
             return
         for item in files:
             edited = datetime.fromtimestamp(item['mtime']).strftime('%Y-%m-%d %H:%M')
-            label = f"{item.get('status', 'added')}: {item['name']}"
-            item_id = self.loose_tree.insert('', tk.END, values=(edited, label))
+            item_id = self.loose_tree.insert('', tk.END, values=(edited, item.get('library', ''), item['name']))
             self.loose_by_id[item_id] = item
         count = len(files)
         if count == 0:
             self.loose_count_var.set("No new files")
-            self.log("No new files were added directly in the target folder.")
+            self.log("No individual tracks were added inside folders that already exist.")
             return
         self.loose_count_var.set(f"{count} new file{'s' if count != 1 else ''}")
-        names = ", ".join(item['name'] for item in files[:8])
+        names = ", ".join(f"{item.get('library', 'File')} {item['name']}" for item in files[:8])
         if count > 8:
             names += f", and {count - 8} more"
-        self.log(f"New files added directly in the target folder: {names}")
+        self.log(f"Individual files inside existing folders: {names}")
+        if any(item.get('library') == 'Lossy' for item in files):
+            self.log("Lossy rows are already in Lossy Music. Copy one file at a time to send it to the phone.")
 
-    def show_selected_loose_file(self):
+    def _selected_loose_file(self):
         selected = self.loose_tree.selection()
         if len(selected) != 1:
-            messagebox.showinfo("Target file", "Select one file that was added directly in the target folder.")
+            return None
+        return self.loose_by_id.get(selected[0])
+
+    def show_selected_loose_file(self):
+        item = self._selected_loose_file()
+        if not item:
+            messagebox.showinfo("New file", "Select one new file.")
             return
-        item = self.loose_by_id.get(selected[0])
-        if not item or not os.path.isfile(item['path']):
-            messagebox.showerror("Target file", "That file is not there anymore.")
+        if not os.path.isfile(item['path']):
+            messagebox.showerror("New file", "That file is not there anymore.")
             return
         subprocess.Popen(f'explorer /select,"{item["path"]}"')
+
+    def copy_selected_loose_file(self):
+        item = self._selected_loose_file()
+        if not item:
+            messagebox.showinfo("Copy file", "Select one new file. Each copy is only that file.")
+            return
+        if not os.path.isfile(item['path']):
+            messagebox.showerror("Copy file", "That file is not there anymore.")
+            return
+        try:
+            self._copy_directory_to_clipboard(item['path'])
+        except Exception as error:
+            messagebox.showerror("Copy file", str(error))
+            return
+        self.status_var.set("Copied one file. Paste it where it should go on the phone.")
+        self.log(f"Copied one file to the clipboard: {item['path']}")
+
+    def queue_selected_tracks(self):
+        selected_ids = set(self.loose_tree.selection())
+        if not selected_ids:
+            messagebox.showinfo("Queue tracks", "Select one or more Non-lossy tracks in the new files list first.")
+            return
+
+        added = 0
+        lossy = 0
+        for item_id in self.loose_tree.get_children():
+            if item_id not in selected_ids:
+                continue
+            item = self.loose_by_id.get(item_id)
+            if not item:
+                continue
+            if item.get('library') != 'Non-lossy':
+                lossy += 1
+                continue
+            if item['path'] in self.queued_paths or not os.path.isfile(item['path']):
+                continue
+            track = {
+                'path': item['path'],
+                'rel': item['name'],
+                'mtime': item['mtime'],
+                'kind': 'track'
+            }
+            edited = datetime.fromtimestamp(track['mtime']).strftime('%Y-%m-%d %H:%M')
+            queue_id = self.queue_tree.insert('', tk.END, values=(edited, track['rel']))
+            self.queue_by_id[queue_id] = track
+            self.conversion_queue.append(track)
+            self.queued_paths.add(track['path'])
+            added += 1
+
+        self._update_queue_count()
+        if lossy:
+            self.log(f"Left {lossy} Lossy file{'s' if lossy != 1 else ''} off the queue because they are already in Lossy Music.")
+        if added == 0:
+            self.log("No tracks were queued. Selected tracks are already queued or are not Non-lossy.")
+        else:
+            self.log(f"Queued {added} track{'s' if added != 1 else ''}. Only those files will be converted or copied.")
 
     def _scan_failed(self, message):
         self.scan_in_progress = False
@@ -771,11 +1135,15 @@ class MusicConverter:
             return
 
         added = 0
+        skipped = 0
         for item_id in self.recent_tree.get_children():
             if item_id not in selected_ids:
                 continue
             folder = self.recent_by_id.get(item_id)
             if not folder or folder['path'] in self.queued_paths:
+                continue
+            if folder.get('status') == 'Converted':
+                skipped += 1
                 continue
             edited = datetime.fromtimestamp(folder['mtime']).strftime('%Y-%m-%d %H:%M')
             item_id = self.queue_tree.insert('', tk.END, values=(edited, folder['rel']))
@@ -785,8 +1153,10 @@ class MusicConverter:
             added += 1
 
         self._update_queue_count()
+        if skipped:
+            self.log(f"Left {skipped} folder{'s' if skipped != 1 else ''} off the queue because they are already converted.")
         if added == 0:
-            self.log("Selected folders are already in the queue.")
+            self.log("Selected folders are already in the queue." if not skipped else "No missing folders were queued.")
         else:
             self.log(f"Queued {added} folder{'s' if added != 1 else ''} for sequential conversion.")
 
@@ -834,9 +1204,16 @@ class MusicConverter:
     def _jobs_for_sources(self, folders):
         """Point each album at its converted folder, keeping the Lossy Music tree."""
         jobs = []
+        seen = set()
         target_base = os.path.normpath(self.target_base_folder)
         target_name = os.path.basename(target_base)
         for folder in folders:
+            if os.path.isfile(folder):
+                folder = os.path.dirname(folder)
+            key = os.path.normcase(os.path.normpath(folder))
+            if key in seen:
+                continue
+            seen.add(key)
             relative = os.path.relpath(folder, self.source_base_folder)
             if relative in ('.', os.curdir):
                 relative = os.path.basename(os.path.normpath(folder))
@@ -1164,19 +1541,21 @@ class MusicConverter:
         folders = []
         for item in self.conversion_queue:
             folder = item['path']
-            if not os.path.isdir(folder):
-                self.log(f"Skipping missing folder: {folder}")
+            is_track = item.get('kind') == 'track'
+            exists = os.path.isfile(folder) if is_track else os.path.isdir(folder)
+            if not exists:
+                self.log(f"Skipping missing {'track' if is_track else 'folder'}: {folder}")
                 continue
             if not self.is_subpath(folder, self.source_base_folder):
                 messagebox.showerror(
                     "Error",
-                    f"Queued folder is not inside the source base folder:\n{folder}"
+                    f"Queued {'track' if is_track else 'folder'} is not inside the source base folder:\n{folder}"
                 )
                 return
             folders.append(folder)
 
         if not folders:
-            messagebox.showerror("Error", "None of the queued folders are still available.")
+            messagebox.showerror("Error", "None of the queued folders or tracks are still available.")
             return
 
         if not os.path.isdir(self.target_base_folder):
@@ -1199,7 +1578,7 @@ class MusicConverter:
         self.queue_conversion_active = True
         self.conversion_in_progress = True
         self._set_conversion_busy(True)
-        self.log(f"Starting sequential conversion of {len(folders)} queued folders")
+        self.log(f"Starting sequential conversion of {len(folders)} queued folders and tracks")
 
         conversion_thread = threading.Thread(target=self.batch_convert)
         conversion_thread.daemon = True
@@ -1344,8 +1723,9 @@ class MusicConverter:
             if not self.conversion_in_progress:
                 break
                 
-            self.log(f"\n--- Processing directory {processed_dirs+1}/{total_dirs}: {os.path.basename(folder)} ---")
-            self.status_var.set(f"Processing directory {processed_dirs+1}/{total_dirs}")
+            kind = 'track' if os.path.isfile(folder) else 'directory'
+            self.log(f"\n--- Processing {kind} {processed_dirs+1}/{total_dirs}: {os.path.basename(folder)} ---")
+            self.status_var.set(f"Processing {kind} {processed_dirs+1}/{total_dirs}")
             
             # Temporarily set the source_subfolder for this iteration
             self.source_subfolder = folder
@@ -1382,7 +1762,11 @@ class MusicConverter:
         files_to_convert = []
         files_to_copy = []
         
-        for root, _, files in os.walk(self.source_subfolder):
+        if os.path.isfile(self.source_subfolder):
+            walked = [(os.path.dirname(self.source_subfolder), [], [os.path.basename(self.source_subfolder)])]
+        else:
+            walked = os.walk(self.source_subfolder)
+        for root, _, files in walked:
             for file in files:
                 ext = os.path.splitext(file)[1].lower()
                 file_path = os.path.join(root, file)
@@ -1835,6 +2219,9 @@ class MusicConverter:
             processed += 1
             self.progress["value"] = processed
             
+        total_convert_files = len(files_to_convert)
+        total_copy_files = len(files_to_copy)
+
         # Store statistics for batch mode
         self.last_processed_count = processed
         self.last_converted_count = total_convert_files
