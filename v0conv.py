@@ -44,6 +44,8 @@ class MusicConverter:
         self.pending_phone_jobs = []
         self.last_converted_outputs = []
         self.device_scan_in_progress = False
+        self.track_loose_files = False
+        self.tracked_loose_files = {}
         
         # Config file for remembering directories
         self.config_file = os.path.join(os.path.expanduser("~"), ".v0conv_config.json")
@@ -156,7 +158,7 @@ class MusicConverter:
             columns=('edited', 'folder'),
             show='headings',
             selectmode='extended',
-            height=6
+            height=5
         )
         self.recent_tree.heading('edited', text='Edited')
         self.recent_tree.heading('folder', text='Folder (relative to source base)')
@@ -166,6 +168,45 @@ class MusicConverter:
         self.recent_tree.configure(yscrollcommand=recent_scroll.set)
         self.recent_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         recent_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        loose_header = ttk.Frame(recent_frame)
+        loose_header.pack(fill=tk.X, padx=5, pady=(0, 2))
+        self.track_loose_files_var = tk.BooleanVar(value=self.track_loose_files)
+        ttk.Checkbutton(
+            loose_header,
+            text="Track individual files",
+            variable=self.track_loose_files_var,
+            command=self._toggle_loose_file_tracking
+        ).pack(side=tk.LEFT)
+        ttk.Label(loose_header, text="New files directly in the target:").pack(side=tk.LEFT, padx=(12, 0))
+        self.loose_count_var = tk.StringVar(value="")
+        ttk.Label(loose_header, textvariable=self.loose_count_var).pack(side=tk.RIGHT)
+        self.show_loose_button = ttk.Button(
+            loose_header,
+            text="Show in Explorer",
+            command=self.show_selected_loose_file
+        )
+        self.show_loose_button.pack(side=tk.RIGHT, padx=5)
+
+        loose_list_frame = ttk.Frame(recent_frame)
+        loose_list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
+        self.loose_tree = ttk.Treeview(
+            loose_list_frame,
+            columns=('edited', 'file'),
+            show='headings',
+            selectmode='browse',
+            height=4
+        )
+        self.loose_tree.heading('edited', text='Edited')
+        self.loose_tree.heading('file', text='New or updated file (directly in target)')
+        self.loose_tree.column('edited', width=140, stretch=False)
+        self.loose_tree.column('file', width=640, stretch=True)
+        loose_scroll = ttk.Scrollbar(loose_list_frame, orient=tk.VERTICAL, command=self.loose_tree.yview)
+        self.loose_tree.configure(yscrollcommand=loose_scroll.set)
+        self.loose_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        loose_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.loose_tree.bind('<Double-1>', lambda _event: self.show_selected_loose_file())
+        self.loose_by_id = {}
 
         queue_frame = ttk.LabelFrame(main_frame, text="Conversion queue (one folder at a time)")
         queue_frame.grid(row=6, column=0, columnspan=3, sticky=tk.W+tk.E+tk.N+tk.S, pady=5)
@@ -553,14 +594,15 @@ class MusicConverter:
         self.log(f"Indexing source folders in {source_base}")
         self.log(f"Indexing target folders in {target_base}")
 
+        track_files = bool(self.track_loose_files_var.get())
         worker = threading.Thread(
             target=self._scan_recent_folders_worker,
-            args=(source_base, target_base, limit),
+            args=(source_base, target_base, limit, track_files),
             daemon=True
         )
         worker.start()
 
-    def _scan_recent_folders_worker(self, source_base, target_base, limit):
+    def _scan_recent_folders_worker(self, source_base, target_base, limit, track_files):
         try:
             source_folders = self._index_directories(source_base, True, "Indexing source")
             self.root.after(0, lambda: self.status_var.set("Indexing target folders..."))
@@ -572,17 +614,75 @@ class MusicConverter:
             ]
             missing.sort(key=lambda folder: folder['mtime'], reverse=True)
             shown = missing[:limit]
+            loose_files = []
+            loose_snapshot = None
+            if track_files:
+                current_files = self._files_directly_in_directory(target_base)
+                loose_files = self._newly_added_direct_files(current_files, self.tracked_loose_files)[:limit]
+                loose_snapshot = {item['name']: item['mtime'] for item in current_files}
             self.root.after(
                 0,
-                lambda shown=shown, source_count=len(source_folders), target_count=len(target_index), missing_count=len(missing), limit=limit: self._show_recent_folders(
-                    shown, source_count, target_count, missing_count, limit
+                lambda shown=shown, source_count=len(source_folders), target_count=len(target_index), missing_count=len(missing), limit=limit, loose_files=loose_files, track_files=track_files, loose_snapshot=loose_snapshot: self._show_recent_folders(
+                    shown, source_count, target_count, missing_count, limit, loose_files, track_files, loose_snapshot
                 )
             )
         except Exception as e:
             message = str(e)
             self.root.after(0, lambda message=message: self._scan_failed(message))
 
-    def _show_recent_folders(self, folders, source_count, target_count, missing_count, limit):
+    def _files_directly_in_directory(self, directory):
+        """Files whose parent is the target folder itself, newest edited date first."""
+        skipped_names = {'desktop.ini', 'thumbs.db'}
+        files = []
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return files
+        for name in names:
+            if name.startswith('.') or name.lower() in skipped_names:
+                continue
+            path = os.path.join(directory, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                edited = os.path.getmtime(path)
+            except OSError:
+                continue
+            files.append({'path': path, 'name': name, 'mtime': edited})
+        files.sort(key=lambda item: item['mtime'], reverse=True)
+        return files
+
+    def _newly_added_direct_files(self, current_files, known_files):
+        """Files new since the last tracking snapshot, or edited again after it."""
+        added = []
+        for item in current_files:
+            previous = known_files.get(item['name']) if known_files else None
+            if previous is None:
+                status = 'added'
+            else:
+                try:
+                    previous_mtime = float(previous)
+                except (TypeError, ValueError):
+                    previous_mtime = 0
+                if item['mtime'] <= previous_mtime + 1:
+                    continue
+                status = 'updated'
+            noted = dict(item)
+            noted['status'] = status
+            added.append(noted)
+        added.sort(key=lambda item: item['mtime'], reverse=True)
+        return added
+
+    def _toggle_loose_file_tracking(self):
+        self.track_loose_files = bool(self.track_loose_files_var.get())
+        self.save_directory_config()
+        if self.track_loose_files:
+            self.loose_count_var.set("Scan to check")
+            self.log("Individual file tracking is on. Scan folders to list files added directly in the target.")
+            return
+        self._show_loose_target_files([], tracking=False)
+
+    def _show_recent_folders(self, folders, source_count, target_count, missing_count, limit, loose_files=None, track_files=False, loose_snapshot=None):
         existing = self.recent_tree.get_children()
         if existing:
             self.recent_tree.delete(*existing)
@@ -606,9 +706,49 @@ class MusicConverter:
             f"Index complete: {source_count} source music folders, "
             f"{target_count} target directories, {missing_count} not found in target."
         )
+        if track_files:
+            self.tracked_loose_files = loose_snapshot or {}
+            self.track_loose_files = True
+            self.save_directory_config()
+        self._show_loose_target_files(loose_files or [], tracking=track_files)
         self.scan_in_progress = False
         if not self.conversion_in_progress:
             self.scan_button.config(state=tk.NORMAL)
+
+    def _show_loose_target_files(self, files, tracking=True):
+        existing = self.loose_tree.get_children()
+        if existing:
+            self.loose_tree.delete(*existing)
+        self.loose_by_id = {}
+        if not tracking:
+            self.loose_count_var.set("Tracking off")
+            return
+        for item in files:
+            edited = datetime.fromtimestamp(item['mtime']).strftime('%Y-%m-%d %H:%M')
+            label = f"{item.get('status', 'added')}: {item['name']}"
+            item_id = self.loose_tree.insert('', tk.END, values=(edited, label))
+            self.loose_by_id[item_id] = item
+        count = len(files)
+        if count == 0:
+            self.loose_count_var.set("No new files")
+            self.log("No new files were added directly in the target folder.")
+            return
+        self.loose_count_var.set(f"{count} new file{'s' if count != 1 else ''}")
+        names = ", ".join(item['name'] for item in files[:8])
+        if count > 8:
+            names += f", and {count - 8} more"
+        self.log(f"New files added directly in the target folder: {names}")
+
+    def show_selected_loose_file(self):
+        selected = self.loose_tree.selection()
+        if len(selected) != 1:
+            messagebox.showinfo("Target file", "Select one file that was added directly in the target folder.")
+            return
+        item = self.loose_by_id.get(selected[0])
+        if not item or not os.path.isfile(item['path']):
+            messagebox.showerror("Target file", "That file is not there anymore.")
+            return
+        subprocess.Popen(f'explorer /select,"{item["path"]}"')
 
     def _scan_failed(self, message):
         self.scan_in_progress = False
@@ -1744,6 +1884,10 @@ class MusicConverter:
                     self.target_base_folder = config.get('target_base_folder', '')
                     self.phone_subfolder = config.get('phone_subfolder') or 'Music'
                     self.phone_device_id = config.get('phone_device_id') or ''
+                    self.track_loose_files = bool(config.get('track_loose_files', False))
+                    stored_files = config.get('tracked_loose_files') or {}
+                    if isinstance(stored_files, dict):
+                        self.tracked_loose_files = stored_files
         except Exception as e:
             # If config file is corrupted or unreadable, start with empty values
             self.source_base_folder = ""
@@ -1757,12 +1901,16 @@ class MusicConverter:
             if hasattr(self, 'phone_subfolder_entry'):
                 phone_subfolder = self.phone_subfolder_entry.get().strip() or 'Music'
                 self.phone_subfolder = phone_subfolder
+            if hasattr(self, 'track_loose_files_var'):
+                self.track_loose_files = bool(self.track_loose_files_var.get())
             config = {
                 'source_base_folder': self.source_base_folder,
                 'source_subfolder': self.source_subfolder,
                 'target_base_folder': self.target_base_folder,
                 'phone_subfolder': phone_subfolder,
-                'phone_device_id': self.phone_device_id
+                'phone_device_id': self.phone_device_id,
+                'track_loose_files': self.track_loose_files,
+                'tracked_loose_files': self.tracked_loose_files
             }
             with open(self.config_file, 'w') as f:
                 json.dump(config, f, indent=2)
