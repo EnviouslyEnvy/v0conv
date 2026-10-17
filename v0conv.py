@@ -161,7 +161,7 @@ class MusicConverter:
         ttk.Button(recent_toolbar, text="Select all", command=self.select_all_recent).pack(side=tk.LEFT, padx=5)
         self.queue_selected_button = ttk.Button(
             recent_toolbar,
-            text="Queue selected",
+            text="Queue folders",
             command=self.queue_selected_folders
         )
         self.queue_selected_button.pack(side=tk.LEFT, padx=5)
@@ -191,35 +191,36 @@ class MusicConverter:
         recent_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         loose_header = ttk.Frame(recent_frame)
-        loose_header.pack(fill=tk.X, padx=5, pady=(0, 2))
+        loose_header.pack(fill=tk.X, padx=5, pady=5)
         self.track_loose_files_var = tk.BooleanVar(value=self.track_loose_files)
         ttk.Checkbutton(
             loose_header,
             text="Track individual files",
             variable=self.track_loose_files_var,
             command=self._toggle_loose_file_tracking
-        ).pack(side=tk.LEFT)
-        ttk.Label(loose_header, text="New files inside existing folders:").pack(side=tk.LEFT, padx=(12, 0))
-        self.loose_count_var = tk.StringVar(value="")
-        ttk.Label(loose_header, textvariable=self.loose_count_var).pack(side=tk.RIGHT)
-        self.copy_loose_button = ttk.Button(
-            loose_header,
-            text="Copy file",
-            command=self.copy_selected_loose_file
-        )
-        self.copy_loose_button.pack(side=tk.RIGHT, padx=(0, 5))
+        ).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(loose_header, text="Select all", command=self.select_all_loose).pack(side=tk.LEFT, padx=5)
         self.queue_loose_button = ttk.Button(
             loose_header,
             text="Queue tracks",
             command=self.queue_selected_tracks
         )
-        self.queue_loose_button.pack(side=tk.RIGHT, padx=5)
+        self.queue_loose_button.pack(side=tk.LEFT, padx=5)
+        ttk.Separator(loose_header, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
         self.show_loose_button = ttk.Button(
             loose_header,
             text="Show in Explorer",
             command=self.show_selected_loose_file
         )
-        self.show_loose_button.pack(side=tk.RIGHT, padx=5)
+        self.show_loose_button.pack(side=tk.LEFT, padx=5)
+        self.copy_loose_button = ttk.Button(
+            loose_header,
+            text="Copy file",
+            command=self.copy_selected_loose_file
+        )
+        self.copy_loose_button.pack(side=tk.LEFT, padx=5)
+        self.loose_count_var = tk.StringVar(value="")
+        ttk.Label(loose_header, textvariable=self.loose_count_var).pack(side=tk.RIGHT)
 
         loose_list_frame = ttk.Frame(recent_frame)
         loose_list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
@@ -1170,6 +1171,11 @@ class MusicConverter:
         children = self.recent_tree.get_children()
         if children:
             self.recent_tree.selection_set(children)
+
+    def select_all_loose(self):
+        children = self.loose_tree.get_children()
+        if children:
+            self.loose_tree.selection_set(children)
 
     def queue_selected_folders(self):
         selected_ids = set(self.recent_tree.selection())
