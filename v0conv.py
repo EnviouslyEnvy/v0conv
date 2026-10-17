@@ -23,7 +23,9 @@ class MusicConverter:
     def __init__(self, root):
         self.root = root
         self.root.title("Lossless to MP3 V0 Converter")
-        self.root.geometry("1000x940")
+        screen_height = self.root.winfo_screenheight()
+        self.root.geometry(f"1000x{max(500, min(940, screen_height - 80))}")
+        self.root.minsize(600, 360)
         self.root.resizable(True, True)
         
         self.source_base_folder = ""
@@ -56,9 +58,26 @@ class MusicConverter:
         self.create_widgets()
         
     def create_widgets(self):
+        # Scrollable page so small windows scroll instead of squeezing the lists
+        page = ttk.Frame(self.root)
+        page.pack(fill=tk.BOTH, expand=True)
+        page.rowconfigure(0, weight=1)
+        page.columnconfigure(0, weight=1)
+        self.page_canvas = tk.Canvas(page, highlightthickness=0, borderwidth=0)
+        page_y_scroll = ttk.Scrollbar(page, orient=tk.VERTICAL, command=self.page_canvas.yview)
+        page_x_scroll = ttk.Scrollbar(page, orient=tk.HORIZONTAL, command=self.page_canvas.xview)
+        self.page_canvas.configure(yscrollcommand=page_y_scroll.set, xscrollcommand=page_x_scroll.set)
+        self.page_canvas.grid(row=0, column=0, sticky=tk.N+tk.S+tk.E+tk.W)
+        page_y_scroll.grid(row=0, column=1, sticky=tk.N+tk.S)
+        page_x_scroll.grid(row=1, column=0, sticky=tk.E+tk.W)
+
         # Main frame
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        main_frame = ttk.Frame(self.page_canvas, padding="10")
+        self.page_frame = main_frame
+        self.page_window = self.page_canvas.create_window((0, 0), window=main_frame, anchor=tk.NW)
+        main_frame.bind('<Configure>', lambda _event: self._fit_page())
+        self.page_canvas.bind('<Configure>', lambda _event: self._fit_page())
+        self.root.bind_all('<MouseWheel>', self._scroll_page, add='+')
         
         # Source base folder selection (for reference only)
         ttk.Label(main_frame, text="Source Base (e.g., V:/Music/):").grid(row=0, column=0, sticky=tk.W, pady=5)
@@ -387,7 +406,31 @@ class MusicConverter:
         self.cancel_button.pack(side=tk.LEFT, padx=5)
         
         ttk.Button(button_frame, text="Exit", command=self.root.quit).pack(side=tk.LEFT, padx=5)
+        self.root.after_idle(self._fit_page)
         self.root.after(400, self.refresh_phone_devices)
+
+    def _fit_page(self):
+        """Stretch the page to the window, but never below the size the lists need."""
+        canvas = self.page_canvas
+        width = max(canvas.winfo_width(), self.page_frame.winfo_reqwidth())
+        height = max(canvas.winfo_height(), self.page_frame.winfo_reqheight())
+        canvas.itemconfigure(self.page_window, width=width, height=height)
+        canvas.configure(scrollregion=(0, 0, width, height))
+
+    def _scroll_page(self, event):
+        widget = event.widget
+        if isinstance(widget, str):
+            return
+        if widget.winfo_class() in ('Treeview', 'Text', 'TCombobox', 'TSpinbox'):
+            return
+        steps = int(-event.delta / 120)
+        if event.state & 0x1:
+            if self.page_frame.winfo_reqwidth() > self.page_canvas.winfo_width():
+                self.page_canvas.xview_scroll(steps, 'units')
+            return
+        if self.page_frame.winfo_reqheight() <= self.page_canvas.winfo_height():
+            return
+        self.page_canvas.yview_scroll(steps, 'units')
         
     def sanitize_path(self, path):
         """Sanitize path by removing quotes and normalizing path separators"""
@@ -1711,6 +1754,7 @@ class MusicConverter:
         """Process multiple directories in batch mode"""
         total_dirs = len(self.source_folders)
         processed_dirs = 0
+        chosen_subfolder = self.source_subfolder
         
         self.log(f"Starting batch conversion of {total_dirs} directories")
         
@@ -1740,6 +1784,8 @@ class MusicConverter:
             
             # Update progress for batch
             processed_dirs += 1
+
+        self.source_subfolder = chosen_subfolder
             
         # Batch conversion complete or cancelled
         if self.conversion_in_progress:
@@ -2268,6 +2314,8 @@ class MusicConverter:
                     config = json.load(f)
                     self.source_base_folder = config.get('source_base_folder', '')
                     self.source_subfolder = config.get('source_subfolder', '')
+                    if self.source_subfolder and os.path.isfile(self.source_subfolder):
+                        self.source_subfolder = os.path.dirname(self.source_subfolder)
                     self.target_base_folder = config.get('target_base_folder', '')
                     self.phone_subfolder = config.get('phone_subfolder') or 'Music'
                     self.phone_device_id = config.get('phone_device_id') or ''
