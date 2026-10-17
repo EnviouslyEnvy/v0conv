@@ -17,7 +17,49 @@ import mutagen
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, TPE1, TIT2, TALB, TRCK, TDRC
 import json
+import tempfile
 import phone_transfer
+
+COPY_TO_CLIPBOARD_SCRIPT = r'''
+$ErrorActionPreference = 'Stop'
+$path = $env:V0CONV_COPY_PATH
+Add-Type -TypeDefinition @"
+using System.Runtime.InteropServices;
+public static class V0ConvClipboard {
+    [DllImport("ole32.dll")] public static extern int OleInitialize(System.IntPtr reserved);
+    [DllImport("ole32.dll")] public static extern int OleFlushClipboard();
+}
+"@
+[void][V0ConvClipboard]::OleInitialize([IntPtr]::Zero)
+$copied = $false
+$reason = ''
+try {
+    $shell = New-Object -ComObject Shell.Application
+    $folder = $shell.NameSpace([IO.Path]::GetDirectoryName($path))
+    if ($null -eq $folder) {
+        $reason = 'Folder not found.'
+    } else {
+        $item = $folder.ParseName([IO.Path]::GetFileName($path))
+        if ($null -eq $item) {
+            $reason = 'Item not found.'
+        } else {
+            $item.InvokeVerb('copy')
+            Start-Sleep -Milliseconds 300
+            $flush = [V0ConvClipboard]::OleFlushClipboard()
+            $copied = $flush -eq 0
+            if (-not $copied) { $reason = "Flush failed ($flush)." }
+        }
+    }
+} catch {
+    $reason = $_.Exception.Message
+}
+if ($copied) {
+    Write-Output 'EXPLORER'
+} else {
+    Set-Clipboard -LiteralPath $path
+    Write-Output "FALLBACK $reason"
+}
+'''
 
 class MusicConverter:
     def __init__(self, root):
@@ -1111,7 +1153,7 @@ class MusicConverter:
             messagebox.showerror("Copy file", "That file is not there anymore.")
             return
         try:
-            self._copy_directory_to_clipboard(item['path'])
+            self._copy_path_to_clipboard(item['path'])
         except Exception as error:
             messagebox.showerror("Copy file", str(error))
             return
@@ -1424,36 +1466,51 @@ class MusicConverter:
             messagebox.showerror("Copy folder", f"That folder is not there anymore:\n{path}")
             return
         try:
-            self._copy_directory_to_clipboard(path)
+            self._copy_path_to_clipboard(path)
         except Exception as error:
             messagebox.showerror("Copy folder", str(error))
             return
         self.status_var.set("Copied one folder. Paste it, then select the next folder.")
         self.log(f"Copied one folder to the clipboard: {path}")
 
-    def _copy_directory_to_clipboard(self, path):
-        """Put one directory on the clipboard the same way Explorer's Copy does."""
+    def _copy_path_to_clipboard(self, path):
+        """
+        Run Explorer's own Copy on one file or folder.
+        Phone folders (MTP) only accept a paste that has the Shell IDList Array format,
+        which a plain file list from Set-Clipboard does not include.
+        """
         env = os.environ.copy()
-        env['V0CONV_COPY_PATH'] = path
-        completed = subprocess.run(
-            [
-                'powershell',
-                '-NoProfile',
-                '-NonInteractive',
-                '-Command',
-                'Set-Clipboard -LiteralPath $env:V0CONV_COPY_PATH'
-            ],
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            env=env,
-            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
-            check=False
-        )
+        env['V0CONV_COPY_PATH'] = os.path.normpath(path)
+        temp_dir = tempfile.mkdtemp(prefix='v0conv-clipboard-')
+        script_path = os.path.join(temp_dir, 'copy.ps1')
+        try:
+            with open(script_path, 'w', encoding='utf-8-sig') as handle:
+                handle.write(COPY_TO_CLIPBOARD_SCRIPT)
+            completed = subprocess.run(
+                [
+                    'powershell',
+                    '-NoProfile',
+                    '-NonInteractive',
+                    '-Sta',
+                    '-ExecutionPolicy', 'Bypass',
+                    '-File', script_path
+                ],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                env=env,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                check=False
+            )
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or '').strip()
-            raise RuntimeError(detail or 'Could not copy that folder to the clipboard.')
+            raise RuntimeError(detail or 'Could not copy that to the clipboard.')
+        if 'EXPLORER' not in completed.stdout:
+            reason = completed.stdout.replace('FALLBACK', '').strip()
+            self.log(f"Explorer copy was not available, so only a file list was copied. {reason}".strip())
 
     def send_queue_to_phone(self):
         folders = [item['path'] for item in self.conversion_queue]
