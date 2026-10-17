@@ -1,0 +1,8 @@
+# React web app is not ready to commit yet
+modern-converter/
+
+# PyInstaller output
+build/
+dist/
+__pycache__/
+*.pyc
